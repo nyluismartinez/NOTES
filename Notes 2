@@ -1,0 +1,635 @@
+Yes. Make the controller consistent with your other controllers by returning:
+
+```csharp
+Task<OperationResult<T>>
+```
+
+Use this organization:
+
+```text
+SharedLibrary
+  Helpers
+    OnPremChunkUploadRequest.cs
+    OnPremChunkCompleteRequest.cs
+    OnPremChunkUploadResponseDto.cs
+    OnPremFileDeleteRequest.cs
+    OnPremFolderDeleteRequest.cs
+    OnPremDeleteResponseDto.cs
+
+Backend
+  Services
+    OnPremChunkUploadService.cs
+
+Backend
+  Controllers
+    OnPremChunkUploadController.cs
+```
+
+---
+
+## 1. SharedLibrary DTOs
+
+### `OnPremChunkUploadRequest.cs`
+
+```csharp
+using Microsoft.AspNetCore.Http;
+
+namespace SharedLibrary.Helpers;
+
+public class OnPremChunkUploadRequest
+{
+    public string FileName { get; set; } = string.Empty;
+
+    public string? Folder { get; set; }
+
+    public int ChunkIndex { get; set; }
+
+    public int TotalChunks { get; set; }
+
+    public IFormFile Chunk { get; set; } = default!;
+}
+```
+
+---
+
+### `OnPremChunkCompleteRequest.cs`
+
+```csharp
+namespace SharedLibrary.Helpers;
+
+public class OnPremChunkCompleteRequest
+{
+    public string FileName { get; set; } = string.Empty;
+
+    public string? Folder { get; set; }
+
+    public int TotalChunks { get; set; }
+}
+```
+
+---
+
+### `OnPremChunkUploadResponseDto.cs`
+
+```csharp
+namespace SharedLibrary.Helpers;
+
+public class OnPremChunkUploadResponseDto
+{
+    public string FileName { get; set; } = string.Empty;
+
+    public string? Folder { get; set; }
+
+    public int ChunkIndex { get; set; }
+
+    public int TotalChunks { get; set; }
+
+    public bool IsCompleted { get; set; }
+
+    public string? FinalPath { get; set; }
+
+    public long Size { get; set; }
+
+    public DateTime UploadedUtc { get; set; }
+}
+```
+
+---
+
+### `OnPremFileDeleteRequest.cs`
+
+```csharp
+namespace SharedLibrary.Helpers;
+
+public class OnPremFileDeleteRequest
+{
+    public string FileName { get; set; } = string.Empty;
+
+    public string? Folder { get; set; }
+}
+```
+
+---
+
+### `OnPremFolderDeleteRequest.cs`
+
+```csharp
+namespace SharedLibrary.Helpers;
+
+public class OnPremFolderDeleteRequest
+{
+    public string? Folder { get; set; }
+
+    public bool CascadeDelete { get; set; } = true;
+}
+```
+
+---
+
+### `OnPremDeleteResponseDto.cs`
+
+```csharp
+namespace SharedLibrary.Helpers;
+
+public class OnPremDeleteResponseDto
+{
+    public bool Deleted { get; set; }
+
+    public string DeletedPath { get; set; } = string.Empty;
+
+    public string Message { get; set; } = string.Empty;
+}
+```
+
+---
+
+# 2. Backend service
+
+### `OnPremChunkUploadService.cs`
+
+```csharp
+using SharedLibrary.Helpers;
+
+namespace TodoApi.Services;
+
+public class OnPremChunkUploadService
+{
+    private readonly IWebHostEnvironment _environment;
+    private readonly string _rootPath;
+    private readonly string _tempPath;
+
+    public OnPremChunkUploadService(
+        IConfiguration configuration,
+        IWebHostEnvironment environment)
+    {
+        _environment = environment;
+
+        var configuredPath = configuration["OnPremStorage:RootPath"] ?? "downloads/temp";
+
+        _rootPath = Path.Combine(_environment.ContentRootPath, configuredPath);
+        _tempPath = Path.Combine(_rootPath, "_chunks");
+    }
+
+    public async Task<OnPremChunkUploadResponseDto> UploadChunkAsync(
+        OnPremChunkUploadRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateChunkRequest(request);
+
+        var safeFileName = GetSafeFileName(request.FileName);
+        var safeFolder = NormalizeFolder(request.Folder);
+
+        var uploadId = CreateUploadId(safeFolder, safeFileName);
+        var chunkFolder = Path.Combine(_tempPath, uploadId);
+
+        Directory.CreateDirectory(chunkFolder);
+
+        var chunkPath = Path.Combine(chunkFolder, $"chunk-{request.ChunkIndex:D8}.part");
+
+        await using var sourceStream = request.Chunk.OpenReadStream();
+        await using var targetStream = new FileStream(
+            chunkPath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 1024 * 1024,
+            useAsync: true);
+
+        await sourceStream.CopyToAsync(targetStream, cancellationToken);
+
+        return new OnPremChunkUploadResponseDto
+        {
+            FileName = safeFileName,
+            Folder = safeFolder,
+            ChunkIndex = request.ChunkIndex,
+            TotalChunks = request.TotalChunks,
+            IsCompleted = false,
+            Size = request.Chunk.Length,
+            UploadedUtc = DateTime.UtcNow
+        };
+    }
+
+    public async Task<OnPremChunkUploadResponseDto> CompleteUploadAsync(
+        OnPremChunkCompleteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(request.FileName))
+            throw new ArgumentException("FileName is required.");
+
+        if (request.TotalChunks <= 0)
+            throw new ArgumentException("TotalChunks must be greater than zero.");
+
+        var safeFileName = GetSafeFileName(request.FileName);
+        var safeFolder = NormalizeFolder(request.Folder);
+
+        var uploadId = CreateUploadId(safeFolder, safeFileName);
+        var chunkFolder = Path.Combine(_tempPath, uploadId);
+
+        if (!Directory.Exists(chunkFolder))
+            throw new DirectoryNotFoundException("Chunk folder was not found.");
+
+        for (var i = 0; i < request.TotalChunks; i++)
+        {
+            var chunkPath = Path.Combine(chunkFolder, $"chunk-{i:D8}.part");
+
+            if (!File.Exists(chunkPath))
+                throw new FileNotFoundException($"Missing chunk {i}.");
+        }
+
+        var finalFolder = Path.Combine(_rootPath, safeFolder);
+        Directory.CreateDirectory(finalFolder);
+
+        var finalPath = Path.Combine(finalFolder, safeFileName);
+
+        await using var finalStream = new FileStream(
+            finalPath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            bufferSize: 1024 * 1024,
+            useAsync: true);
+
+        for (var i = 0; i < request.TotalChunks; i++)
+        {
+            var chunkPath = Path.Combine(chunkFolder, $"chunk-{i:D8}.part");
+
+            await using var chunkStream = new FileStream(
+                chunkPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: 1024 * 1024,
+                useAsync: true);
+
+            await chunkStream.CopyToAsync(finalStream, cancellationToken);
+        }
+
+        Directory.Delete(chunkFolder, recursive: true);
+
+        var fileInfo = new FileInfo(finalPath);
+
+        return new OnPremChunkUploadResponseDto
+        {
+            FileName = safeFileName,
+            Folder = safeFolder,
+            ChunkIndex = request.TotalChunks - 1,
+            TotalChunks = request.TotalChunks,
+            IsCompleted = true,
+            FinalPath = finalPath,
+            Size = fileInfo.Length,
+            UploadedUtc = DateTime.UtcNow
+        };
+    }
+
+    public Task<OnPremDeleteResponseDto> DeleteFileAsync(
+        OnPremFileDeleteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(request.FileName))
+            throw new ArgumentException("FileName is required.");
+
+        var safeFileName = GetSafeFileName(request.FileName);
+        var safeFolder = NormalizeFolder(request.Folder);
+
+        var filePath = Path.Combine(_rootPath, safeFolder, safeFileName);
+
+        if (!File.Exists(filePath))
+        {
+            return Task.FromResult(new OnPremDeleteResponseDto
+            {
+                Deleted = false,
+                DeletedPath = filePath,
+                Message = "File not found."
+            });
+        }
+
+        File.Delete(filePath);
+
+        return Task.FromResult(new OnPremDeleteResponseDto
+        {
+            Deleted = true,
+            DeletedPath = filePath,
+            Message = "File deleted successfully."
+        });
+    }
+
+    public Task<OnPremDeleteResponseDto> DeleteFolderAsync(
+        OnPremFolderDeleteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var safeFolder = NormalizeFolder(request.Folder);
+
+        if (string.IsNullOrWhiteSpace(safeFolder))
+            throw new ArgumentException("Folder is required.");
+
+        var folderPath = Path.Combine(_rootPath, safeFolder);
+
+        if (!Directory.Exists(folderPath))
+        {
+            return Task.FromResult(new OnPremDeleteResponseDto
+            {
+                Deleted = false,
+                DeletedPath = folderPath,
+                Message = "Folder not found."
+            });
+        }
+
+        Directory.Delete(folderPath, recursive: request.CascadeDelete);
+
+        return Task.FromResult(new OnPremDeleteResponseDto
+        {
+            Deleted = true,
+            DeletedPath = folderPath,
+            Message = request.CascadeDelete
+                ? "Folder and all files were deleted successfully."
+                : "Folder deleted successfully."
+        });
+    }
+
+    private static void ValidateChunkRequest(OnPremChunkUploadRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.FileName))
+            throw new ArgumentException("FileName is required.");
+
+        if (request.Chunk == null || request.Chunk.Length == 0)
+            throw new ArgumentException("Chunk is required.");
+
+        if (request.ChunkIndex < 0)
+            throw new ArgumentException("ChunkIndex cannot be negative.");
+
+        if (request.TotalChunks <= 0)
+            throw new ArgumentException("TotalChunks must be greater than zero.");
+
+        if (request.ChunkIndex >= request.TotalChunks)
+            throw new ArgumentException("ChunkIndex cannot be greater than or equal to TotalChunks.");
+    }
+
+    private static string NormalizeFolder(string? folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder))
+            return string.Empty;
+
+        var cleanFolder = folder
+            .Trim()
+            .Trim('/', '\\')
+            .Replace("/", Path.DirectorySeparatorChar.ToString())
+            .Replace("\\", Path.DirectorySeparatorChar.ToString());
+
+        return cleanFolder;
+    }
+
+    private static string GetSafeFileName(string fileName)
+    {
+        var safeFileName = Path.GetFileName(fileName);
+
+        if (string.IsNullOrWhiteSpace(safeFileName))
+            throw new ArgumentException("Invalid file name.");
+
+        return safeFileName;
+    }
+
+    private static string CreateUploadId(string folder, string fileName)
+    {
+        var raw = $"{folder}_{fileName}".Replace("\\", "_").Replace("/", "_");
+
+        foreach (var invalidChar in Path.GetInvalidFileNameChars())
+        {
+            raw = raw.Replace(invalidChar, '_');
+        }
+
+        return raw;
+    }
+}
+```
+
+---
+
+# 3. Backend controller
+
+### `OnPremChunkUploadController.cs`
+
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using SharedLibrary.Helpers;
+using SharedLibrary.Utilities;
+using TodoApi.Services;
+
+namespace TodoApi.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+public class OnPremChunkUploadController : ControllerBase
+{
+    private readonly OnPremChunkUploadService _chunkUploadService;
+
+    public OnPremChunkUploadController(OnPremChunkUploadService chunkUploadService)
+    {
+        _chunkUploadService = chunkUploadService;
+    }
+
+    /// <summary>
+    /// Uploads one chunk of a large file to the on-prem server.
+    /// </summary>
+    /// <remarks>
+    /// This endpoint receives one file chunk using multipart/form-data.
+    ///
+    /// Example form-data request:
+    /// <pre>
+    /// FileName    = large-video.mp4
+    /// Folder      = case-123/folder-abc
+    /// ChunkIndex  = 0
+    /// TotalChunks = 10
+    /// Chunk       = binary chunk file
+    /// </pre>
+    /// </remarks>
+    /// <param name="request">Request containing file name, folder, chunk index, total chunks, and the chunk file.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>Information about the uploaded chunk.</returns>
+    [HttpPost("file/upload-chunk")]
+    [Consumes("multipart/form-data")]
+    public async Task<OperationResult<OnPremChunkUploadResponseDto>> UploadChunk(
+        [FromForm] OnPremChunkUploadRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await _chunkUploadService.UploadChunkAsync(
+                request,
+                cancellationToken);
+
+            return OperationResult<OnPremChunkUploadResponseDto>.Success(result);
+        }
+        catch (Exception ex)
+        {
+            return OperationResult<OnPremChunkUploadResponseDto>.Failure(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Completes a chunk upload by merging all uploaded chunks into the final file.
+    /// </summary>
+    /// <remarks>
+    /// Example JSON request:
+    /// <pre>
+    /// {
+    ///   "fileName": "large-video.mp4",
+    ///   "folder": "case-123/folder-abc",
+    ///   "totalChunks": 10
+    /// }
+    /// </pre>
+    /// </remarks>
+    /// <param name="request">Request containing the file name, folder, and total number of chunks.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>Final uploaded file information.</returns>
+    [HttpPost("file/complete-upload")]
+    public async Task<OperationResult<OnPremChunkUploadResponseDto>> CompleteUpload(
+        [FromBody] OnPremChunkCompleteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await _chunkUploadService.CompleteUploadAsync(
+                request,
+                cancellationToken);
+
+            return OperationResult<OnPremChunkUploadResponseDto>.Success(result);
+        }
+        catch (Exception ex)
+        {
+            return OperationResult<OnPremChunkUploadResponseDto>.Failure(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Deletes one uploaded file from the on-prem server.
+    /// </summary>
+    /// <remarks>
+    /// Example JSON request:
+    /// <pre>
+    /// {
+    ///   "fileName": "large-video.mp4",
+    ///   "folder": "case-123/folder-abc"
+    /// }
+    /// </pre>
+    /// </remarks>
+    /// <param name="request">Request containing the folder and file name to delete.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>Delete result.</returns>
+    [HttpDelete("file/delete-file")]
+    public async Task<OperationResult<OnPremDeleteResponseDto>> DeleteFile(
+        [FromBody] OnPremFileDeleteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await _chunkUploadService.DeleteFileAsync(
+                request,
+                cancellationToken);
+
+            if (!result.Deleted)
+                return OperationResult<OnPremDeleteResponseDto>.Failure(result.Message);
+
+            return OperationResult<OnPremDeleteResponseDto>.Success(result);
+        }
+        catch (Exception ex)
+        {
+            return OperationResult<OnPremDeleteResponseDto>.Failure(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Deletes a folder from the on-prem server.
+    /// </summary>
+    /// <remarks>
+    /// This endpoint can delete a folder and all files/subfolders inside it.
+    ///
+    /// Example JSON request:
+    /// <pre>
+    /// {
+    ///   "folder": "case-123/folder-abc",
+    ///   "cascadeDelete": true
+    /// }
+    /// </pre>
+    /// </remarks>
+    /// <param name="request">Request containing the folder path and cascade delete option.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>Delete result.</returns>
+    [HttpDelete("folder/delete-folder")]
+    public async Task<OperationResult<OnPremDeleteResponseDto>> DeleteFolder(
+        [FromBody] OnPremFolderDeleteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await _chunkUploadService.DeleteFolderAsync(
+                request,
+                cancellationToken);
+
+            if (!result.Deleted)
+                return OperationResult<OnPremDeleteResponseDto>.Failure(result.Message);
+
+            return OperationResult<OnPremDeleteResponseDto>.Success(result);
+        }
+        catch (Exception ex)
+        {
+            return OperationResult<OnPremDeleteResponseDto>.Failure(ex.Message);
+        }
+    }
+}
+```
+
+---
+
+# 4. Register service in `Program.cs`
+
+```csharp
+using Microsoft.AspNetCore.Http.Features;
+using TodoApi.Services;
+
+var maxUploadSize = 50L * 1024L * 1024L; // 50 MB per chunk
+
+builder.Services.Configure<FormOptions>(options =>
+{
+    options.MultipartBodyLengthLimit = maxUploadSize;
+});
+
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.Limits.MaxRequestBodySize = maxUploadSize;
+});
+
+builder.Services.AddScoped<OnPremChunkUploadService>();
+```
+
+Important: with chunk upload, this limit is **per chunk**, not the full file.
+
+Example:
+
+```text
+Chunk size = 10 MB
+Max request size = 50 MB
+Final file can be 10 GB+
+```
+
+---
+
+# 5. `appsettings.json`
+
+```json
+"OnPremStorage": {
+  "RootPath": "downloads/temp",
+  "MaxFileSizeGB": 20
+}
+```
+
+Your files will be saved under:
+
+```text
+BackendProject/downloads/temp/case-123/folder-abc/large-video.mp4
+```
+
+Temporary chunks will be saved under:
+
+```text
+BackendProject/downloads/temp/_chunks/
+```
