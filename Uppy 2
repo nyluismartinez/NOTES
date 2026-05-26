@@ -1,0 +1,373 @@
+Yes, it can still do **parallel uploads with chunks**.
+
+But important distinction:
+
+```text
+Uppy + Tus
+= resumable uploads + parallel files
+
+Custom chunk controller
+= resumable uploads + parallel files + parallel chunks
+```
+
+For what you want, I recommend:
+
+```text
+Use custom controller-based chunk upload.
+Do not use Tus middleware for this part.
+```
+
+Your architecture should be:
+
+```text
+Frontend Blazor/MudBlazor
+    |
+    | calls API controller
+    v
+Backend UploadController
+    |
+    | media files
+    v
+On-prem temp folder
+    |
+    v
+FFmpeg convert to WAV
+    |
+    v
+Azure Blob Storage
+
+
+Other files
+    |
+    v
+Upload directly to Azure Blob Storage
+```
+
+## Correct flow for media files
+
+```text
+1. Frontend selects audio/video files
+
+2. Frontend calls:
+   POST /api/media-upload/start
+
+3. Backend returns:
+   uploadId
+   chunkSize
+   parallelUploadLimit
+
+4. Frontend splits file into chunks
+
+5. Frontend uploads 4, 5, or 6 chunks/files in parallel:
+   POST /api/media-upload/chunk
+
+6. Backend saves chunks to on-prem temp folder
+
+7. Frontend calls:
+   POST /api/media-upload/complete
+
+8. Backend combines chunks into original file
+
+9. Backend calls your FFmpeg service
+
+10. Backend uploads WAV to Blob Storage
+```
+
+## Rename settings to request
+
+Yes. Instead of `UploadSettings`, use:
+
+```text
+UploadSettingsRequest
+```
+
+Save in:
+
+```text
+SharedLibrary/DTOs/Upload/UploadSettingsRequest.cs
+```
+
+```csharp
+namespace SharedLibrary.DTOs.Upload;
+
+public class UploadSettingsRequest
+{
+    public string FileName { get; set; } = "";
+    public string ContentType { get; set; } = "";
+    public long FileSize { get; set; }
+
+    public int ChunkSizeInBytes { get; set; } = 10 * 1024 * 1024;
+
+    public int ParallelUploadLimit { get; set; } = 4;
+
+    public string UploadCategory { get; set; } = "media";
+
+    public Guid? CaseId { get; set; }
+    public Guid? FolderId { get; set; }
+    public Guid? CaseFileId { get; set; }
+}
+```
+
+## Response DTO
+
+Save in:
+
+```text
+SharedLibrary/DTOs/Upload/UploadSessionResponse.cs
+```
+
+```csharp
+namespace SharedLibrary.DTOs.Upload;
+
+public class UploadSessionResponse
+{
+    public Guid UploadId { get; set; }
+
+    public string FileName { get; set; } = "";
+
+    public int ChunkSizeInBytes { get; set; }
+
+    public int ParallelUploadLimit { get; set; }
+
+    public int TotalChunks { get; set; }
+}
+```
+
+## Chunk request
+
+Save in:
+
+```text
+SharedLibrary/DTOs/Upload/UploadChunkRequest.cs
+```
+
+```csharp
+namespace SharedLibrary.DTOs.Upload;
+
+public class UploadChunkRequest
+{
+    public Guid UploadId { get; set; }
+
+    public int ChunkIndex { get; set; }
+
+    public int TotalChunks { get; set; }
+
+    public string FileName { get; set; } = "";
+}
+```
+
+## Backend controller
+
+Save in:
+
+```text
+Backend/Controllers/MediaUploadController.cs
+```
+
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using SharedLibrary.DTOs.Upload;
+using SharedLibrary.Wrappers;
+
+namespace Backend.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+public class MediaUploadController : ControllerBase
+{
+    private readonly MediaUploadService _mediaUploadService;
+
+    public MediaUploadController(MediaUploadService mediaUploadService)
+    {
+        _mediaUploadService = mediaUploadService;
+    }
+
+    [HttpPost("start")]
+    public async Task<ActionResult<OperationResult<UploadSessionResponse>>> StartUpload(
+        [FromBody] UploadSettingsRequest request,
+        CancellationToken cancellationToken)
+    {
+        var result = await _mediaUploadService.StartUploadAsync(request, cancellationToken);
+        return Ok(result);
+    }
+
+    [HttpPost("chunk")]
+    [RequestSizeLimit(long.MaxValue)]
+    public async Task<ActionResult<OperationResult<bool>>> UploadChunk(
+        [FromForm] Guid uploadId,
+        [FromForm] int chunkIndex,
+        [FromForm] int totalChunks,
+        [FromForm] string fileName,
+        [FromForm] IFormFile chunk,
+        CancellationToken cancellationToken)
+    {
+        var result = await _mediaUploadService.SaveChunkAsync(
+            uploadId,
+            chunkIndex,
+            totalChunks,
+            fileName,
+            chunk,
+            cancellationToken);
+
+        return Ok(result);
+    }
+
+    [HttpPost("complete")]
+    public async Task<ActionResult<OperationResult<string>>> CompleteUpload(
+        [FromBody] UploadChunkRequest request,
+        CancellationToken cancellationToken)
+    {
+        var result = await _mediaUploadService.CompleteUploadAsync(request, cancellationToken);
+        return Ok(result);
+    }
+}
+```
+
+## Backend service
+
+Save in:
+
+```text
+Backend/Services/MediaUploadService.cs
+```
+
+```csharp
+using SharedLibrary.DTOs.Upload;
+using SharedLibrary.Wrappers;
+
+namespace Backend.Services;
+
+public class MediaUploadService
+{
+    private readonly IWebHostEnvironment _environment;
+
+    public MediaUploadService(IWebHostEnvironment environment)
+    {
+        _environment = environment;
+    }
+
+    public Task<OperationResult<UploadSessionResponse>> StartUploadAsync(
+        UploadSettingsRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var uploadId = Guid.NewGuid();
+
+        var totalChunks = (int)Math.Ceiling(
+            request.FileSize / (double)request.ChunkSizeInBytes);
+
+        var response = new UploadSessionResponse
+        {
+            UploadId = uploadId,
+            FileName = request.FileName,
+            ChunkSizeInBytes = request.ChunkSizeInBytes,
+            ParallelUploadLimit = request.ParallelUploadLimit,
+            TotalChunks = totalChunks
+        };
+
+        var folder = GetUploadFolder(uploadId);
+        Directory.CreateDirectory(folder);
+
+        return Task.FromResult(OperationResult<UploadSessionResponse>.Success(response));
+    }
+
+    public async Task<OperationResult<bool>> SaveChunkAsync(
+        Guid uploadId,
+        int chunkIndex,
+        int totalChunks,
+        string fileName,
+        IFormFile chunk,
+        CancellationToken cancellationToken = default)
+    {
+        var folder = GetUploadFolder(uploadId);
+        Directory.CreateDirectory(folder);
+
+        var chunkPath = Path.Combine(folder, $"{chunkIndex}.chunk");
+
+        await using var stream = new FileStream(chunkPath, FileMode.Create, FileAccess.Write);
+        await chunk.CopyToAsync(stream, cancellationToken);
+
+        return OperationResult<bool>.Success(true, $"Chunk {chunkIndex + 1}/{totalChunks} uploaded.");
+    }
+
+    public async Task<OperationResult<string>> CompleteUploadAsync(
+        UploadChunkRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var folder = GetUploadFolder(request.UploadId);
+        var finalFilePath = Path.Combine(folder, request.FileName);
+
+        await using var finalStream = new FileStream(finalFilePath, FileMode.Create);
+
+        for (var i = 0; i < request.TotalChunks; i++)
+        {
+            var chunkPath = Path.Combine(folder, $"{i}.chunk");
+
+            if (!File.Exists(chunkPath))
+                return OperationResult<string>.Failure($"Missing chunk {i}.");
+
+            await using var chunkStream = new FileStream(chunkPath, FileMode.Open, FileAccess.Read);
+            await chunkStream.CopyToAsync(finalStream, cancellationToken);
+        }
+
+        // Here call your existing FFmpeg method.
+        // await _ffmpegService.ConvertToWavAsync(finalFilePath, wavOutputPath);
+
+        // Then upload WAV to Blob Storage.
+        // await _blobStorageService.UploadFileAsync(wavOutputPath, blobPath);
+
+        return OperationResult<string>.Success(finalFilePath, "Upload completed and file assembled.");
+    }
+
+    private string GetUploadFolder(Guid uploadId)
+    {
+        return Path.Combine(
+            _environment.ContentRootPath,
+            "Uploads",
+            "Media",
+            uploadId.ToString());
+    }
+}
+```
+
+## Register service in backend `Program.cs`
+
+```csharp
+builder.Services.AddScoped<MediaUploadService>();
+```
+
+No `UploadSettings` from `Program.cs`.
+
+The frontend sends this:
+
+```json
+{
+  "fileName": "meeting.mp4",
+  "contentType": "video/mp4",
+  "fileSize": 900000000,
+  "chunkSizeInBytes": 10485760,
+  "parallelUploadLimit": 4,
+  "uploadCategory": "media"
+}
+```
+
+## Answer to your question
+
+Yes:
+
+```text
+Parallel files? Yes.
+Parallel chunks? Yes, with custom controller.
+Configurable 4, 5, 6? Yes.
+```
+
+For your specific requirement, I would use:
+
+```text
+Media files:
+Custom chunk controller → on-prem → FFmpeg → WAV → Blob
+
+Other files:
+Direct Azure Blob block upload → Blob Storage
+```
+
+This is cleaner than forcing Tus for everything.
