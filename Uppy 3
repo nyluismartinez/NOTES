@@ -1,0 +1,424 @@
+Below is the **frontend only**.
+
+## 1. Save JS file
+
+Create:
+
+```text
+Frontend/wwwroot/js/mediaChunkUploader.js
+```
+
+```javascript
+window.mediaChunkUploader = {
+    uploadFiles: async function (files, dotNetRef, options) {
+        const chunkSize = options.chunkSizeInBytes || 10485760;
+        const parallelLimit = options.parallelUploadLimit || 4;
+        const backendBaseUrl = options.backendBaseUrl || "";
+
+        for (const file of files) {
+            await this.uploadSingleFile(file, dotNetRef, {
+                chunkSize,
+                parallelLimit,
+                backendBaseUrl
+            });
+        }
+    },
+
+    uploadSingleFile: async function (file, dotNetRef, options) {
+        const totalChunks = Math.ceil(file.size / options.chunkSize);
+
+        const startResponse = await fetch(`${options.backendBaseUrl}/api/MediaUpload/start`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                fileName: file.name,
+                contentType: file.type,
+                fileSize: file.size,
+                chunkSizeInBytes: options.chunkSize,
+                parallelUploadLimit: options.parallelLimit,
+                uploadCategory: "media"
+            })
+        });
+
+        const startJson = await startResponse.json();
+
+        if (!startJson.status) {
+            await dotNetRef.invokeMethodAsync("OnUploadError", file.name, startJson.message || "Could not start upload.");
+            return;
+        }
+
+        const uploadId = startJson.result.uploadId;
+
+        let uploadedChunks = 0;
+        let nextChunkIndex = 0;
+
+        const uploadChunk = async () => {
+            while (nextChunkIndex < totalChunks) {
+                const chunkIndex = nextChunkIndex++;
+                const start = chunkIndex * options.chunkSize;
+                const end = Math.min(start + options.chunkSize, file.size);
+                const chunkBlob = file.slice(start, end);
+
+                const formData = new FormData();
+                formData.append("uploadId", uploadId);
+                formData.append("chunkIndex", chunkIndex);
+                formData.append("totalChunks", totalChunks);
+                formData.append("fileName", file.name);
+                formData.append("chunk", chunkBlob, `${file.name}.part${chunkIndex}`);
+
+                const response = await fetch(`${options.backendBaseUrl}/api/MediaUpload/chunk`, {
+                    method: "POST",
+                    body: formData
+                });
+
+                const json = await response.json();
+
+                if (!json.status) {
+                    throw new Error(json.message || `Chunk ${chunkIndex} failed.`);
+                }
+
+                uploadedChunks++;
+
+                const percentage = Math.round((uploadedChunks / totalChunks) * 100);
+
+                await dotNetRef.invokeMethodAsync(
+                    "OnUploadProgress",
+                    file.name,
+                    percentage);
+            }
+        };
+
+        const workers = [];
+
+        for (let i = 0; i < options.parallelLimit; i++) {
+            workers.push(uploadChunk());
+        }
+
+        try {
+            await Promise.all(workers);
+
+            const completeResponse = await fetch(`${options.backendBaseUrl}/api/MediaUpload/complete`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    uploadId: uploadId,
+                    fileName: file.name,
+                    totalChunks: totalChunks,
+                    chunkIndex: 0
+                })
+            });
+
+            const completeJson = await completeResponse.json();
+
+            if (!completeJson.status) {
+                await dotNetRef.invokeMethodAsync("OnUploadError", file.name, completeJson.message || "Upload completion failed.");
+                return;
+            }
+
+            await dotNetRef.invokeMethodAsync("OnUploadCompleted", file.name);
+        }
+        catch (error) {
+            await dotNetRef.invokeMethodAsync("OnUploadError", file.name, error.message);
+        }
+    }
+};
+```
+
+---
+
+## 2. Add script reference
+
+In your frontend app, add this to:
+
+```text
+Frontend/Components/App.razor
+```
+
+or your main layout file:
+
+```html
+<script src="/js/mediaChunkUploader.js"></script>
+```
+
+---
+
+## 3. Create MudBlazor component
+
+Create:
+
+```text
+Frontend/Pages/MediaUpload.razor
+```
+
+```razor
+@page "/media-upload"
+@rendermode InteractiveServer
+
+@using Microsoft.AspNetCore.Components.Forms
+@using Microsoft.JSInterop
+@implements IAsyncDisposable
+
+@inject IJSRuntime JS
+
+<MudPaper Class="pa-6" Elevation="2">
+
+    <MudText Typo="Typo.h5" Class="mb-2">
+        Media Upload
+    </MudText>
+
+    <MudText Typo="Typo.body2" Class="mb-4">
+        Upload audio/video files using parallel chunk uploads.
+    </MudText>
+
+    <MudGrid Class="mb-4">
+
+        <MudItem xs="12" md="4">
+            <MudSelect T="int"
+                       Label="Parallel uploads"
+                       @bind-Value="_parallelUploadLimit">
+                <MudSelectItem Value="1">1</MudSelectItem>
+                <MudSelectItem Value="2">2</MudSelectItem>
+                <MudSelectItem Value="3">3</MudSelectItem>
+                <MudSelectItem Value="4">4</MudSelectItem>
+                <MudSelectItem Value="5">5</MudSelectItem>
+                <MudSelectItem Value="6">6</MudSelectItem>
+            </MudSelect>
+        </MudItem>
+
+        <MudItem xs="12" md="4">
+            <MudSelect T="int"
+                       Label="Chunk size"
+                       @bind-Value="_chunkSizeInMb">
+                <MudSelectItem Value="5">5 MB</MudSelectItem>
+                <MudSelectItem Value="10">10 MB</MudSelectItem>
+                <MudSelectItem Value="25">25 MB</MudSelectItem>
+                <MudSelectItem Value="50">50 MB</MudSelectItem>
+            </MudSelect>
+        </MudItem>
+
+    </MudGrid>
+
+    <MudPaper Class="pa-4 mb-4" Outlined="true">
+        <InputFile OnChange="OnFilesSelected"
+                   multiple
+                   accept="audio/*,video/*" />
+    </MudPaper>
+
+    <MudStack Row="true" Spacing="2" Class="mb-4">
+        <MudButton Color="Color.Primary"
+                   Variant="Variant.Filled"
+                   Disabled="@(!_selectedFiles.Any() || _isUploading)"
+                   OnClick="StartUploadAsync">
+            Start Upload
+        </MudButton>
+
+        <MudButton Color="Color.Default"
+                   Variant="Variant.Outlined"
+                   Disabled="@_isUploading"
+                   OnClick="ClearFiles">
+            Clear
+        </MudButton>
+    </MudStack>
+
+    @if (_selectedFiles.Any())
+    {
+        <MudText Typo="Typo.subtitle1" Class="mb-2">
+            Selected Files
+        </MudText>
+
+        @foreach (var file in _selectedFiles)
+        {
+            var progress = GetProgress(file.Name);
+
+            <MudPaper Class="pa-3 mb-2" Outlined="true">
+                <MudText Typo="Typo.body2">
+                    @file.Name
+                </MudText>
+
+                <MudText Typo="Typo.caption">
+                    @FormatBytes(file.Size)
+                </MudText>
+
+                <MudProgressLinear Value="@progress"
+                                   Color="Color.Primary"
+                                   Class="mt-2" />
+
+                <MudText Typo="Typo.caption">
+                    @progress%
+                </MudText>
+            </MudPaper>
+        }
+    }
+
+    @if (!string.IsNullOrWhiteSpace(_statusMessage))
+    {
+        <MudAlert Severity="@_alertSeverity" Class="mt-4">
+            @_statusMessage
+        </MudAlert>
+    }
+
+</MudPaper>
+
+@code {
+    private DotNetObjectReference<MediaUpload>? _dotNetRef;
+
+    private readonly List<IBrowserFile> _selectedFiles = [];
+    private readonly Dictionary<string, int> _progressByFile = [];
+
+    private int _parallelUploadLimit = 4;
+    private int _chunkSizeInMb = 10;
+
+    private bool _isUploading;
+    private string? _statusMessage;
+    private Severity _alertSeverity = Severity.Info;
+
+    protected override void OnInitialized()
+    {
+        _dotNetRef = DotNetObjectReference.Create(this);
+    }
+
+    private void OnFilesSelected(InputFileChangeEventArgs e)
+    {
+        _selectedFiles.Clear();
+        _progressByFile.Clear();
+
+        foreach (var file in e.GetMultipleFiles())
+        {
+            _selectedFiles.Add(file);
+            _progressByFile[file.Name] = 0;
+        }
+
+        _statusMessage = $"{_selectedFiles.Count} file(s) selected.";
+        _alertSeverity = Severity.Info;
+    }
+
+    private async Task StartUploadAsync()
+    {
+        if (!_selectedFiles.Any())
+            return;
+
+        _isUploading = true;
+        _statusMessage = "Upload started.";
+        _alertSeverity = Severity.Info;
+
+        var chunkSizeInBytes = _chunkSizeInMb * 1024 * 1024;
+
+        await JS.InvokeVoidAsync(
+            "mediaChunkUploader.uploadFiles",
+            _selectedFiles,
+            _dotNetRef,
+            new
+            {
+                chunkSizeInBytes,
+                parallelUploadLimit = _parallelUploadLimit,
+
+                // If backend is same domain, leave empty.
+                // If backend is different project/port, use:
+                // backendBaseUrl = "https://localhost:7001"
+                backendBaseUrl = "https://localhost:7001"
+            });
+
+        _isUploading = false;
+    }
+
+    private void ClearFiles()
+    {
+        _selectedFiles.Clear();
+        _progressByFile.Clear();
+        _statusMessage = null;
+    }
+
+    private int GetProgress(string fileName)
+    {
+        return _progressByFile.TryGetValue(fileName, out var progress)
+            ? progress
+            : 0;
+    }
+
+    [JSInvokable]
+    public Task OnUploadProgress(string fileName, int percentage)
+    {
+        _progressByFile[fileName] = percentage;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public Task OnUploadCompleted(string fileName)
+    {
+        _progressByFile[fileName] = 100;
+        _statusMessage = $"{fileName} uploaded successfully.";
+        _alertSeverity = Severity.Success;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    [JSInvokable]
+    public Task OnUploadError(string fileName, string errorMessage)
+    {
+        _statusMessage = $"{fileName}: {errorMessage}";
+        _alertSeverity = Severity.Error;
+        _isUploading = false;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] sizes = ["B", "KB", "MB", "GB", "TB"];
+        double len = bytes;
+        var order = 0;
+
+        while (len >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            len /= 1024;
+        }
+
+        return $"{len:0.##} {sizes[order]}";
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _dotNetRef?.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}
+```
+
+---
+
+## What this gives you
+
+```text
+Frontend project:
+MediaUpload.razor
+    - MudBlazor UI
+    - file selector
+    - parallel upload selector
+    - chunk size selector
+    - progress bars
+
+mediaChunkUploader.js
+    - splits files into chunks
+    - uploads chunks in parallel
+    - calls backend controller endpoints
+```
+
+Change this value for 4, 5, or 6 parallel chunk uploads:
+
+```csharp
+private int _parallelUploadLimit = 4;
+```
+
+And this is the backend URL:
+
+```csharp
+backendBaseUrl = "https://localhost:7001"
+```
+
+Change it to your backend API project URL.
